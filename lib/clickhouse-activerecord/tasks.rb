@@ -66,15 +66,17 @@ module ClickhouseActiverecord
     end
 
     def structure_load(*args)
-      File.read(args.first).split(";\n\n").each do |sql|
-        if sql.gsub(/[a-z]/i, '').blank?
-          next
-        elsif sql =~ /^INSERT INTO/
-          connection.execute(sql, nil, format: nil)
-        elsif sql =~ /^CREATE .*?FUNCTION/
-          connection.execute(sql, nil, format: nil)
-        else
-          connection.execute(sql)
+      with_master_connection do
+        File.read(args.first).split(";\n\n").each do |sql|
+          if sql.gsub(/[a-z]/i, '').blank?
+            next
+          elsif sql =~ /^INSERT INTO/
+            connection.execute(sql, nil, format: nil)
+          elsif sql =~ /^CREATE .*?FUNCTION/
+            connection.execute(sql, nil, format: nil)
+          else
+            connection.execute(sql)
+          end
         end
       end
     end
@@ -85,10 +87,12 @@ module ClickhouseActiverecord
       verbose = ENV["VERBOSE"] ? ENV["VERBOSE"] != "false" : true
       scope = ENV["SCOPE"]
       verbose_was, ActiveRecord::Migration.verbose = ActiveRecord::Migration.verbose, verbose
-      connection.migration_context.migrate(target_version) do |migration|
-        scope.blank? || scope == migration.scope
+      with_master_connection do
+        connection.migration_context.migrate(target_version) do |migration|
+          scope.blank? || scope == migration.scope
+        end
+        ActiveRecord::Base.clear_cache!
       end
-      ActiveRecord::Base.clear_cache!
     ensure
       ActiveRecord::Migration.verbose = verbose_was
     end
