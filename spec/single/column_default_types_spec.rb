@@ -153,6 +153,7 @@ RSpec.describe 'Column default types', :migrations do
       expect(record.nullable_string).to be_nil
       expect(record.low_cardinality_string).to be_nil
       expect(record.nullable_int).to be_nil
+      expect(record.null_literal_string).to eq('NULL')
     end
 
     it 'inserts NULL for DEFAULT NULL columns when partial inserts are disabled' do
@@ -160,6 +161,7 @@ RSpec.describe 'Column default types', :migrations do
       null_model.create!(id: 1)
 
       expect(null_model.where(nullable_string: nil, low_cardinality_string: nil, nullable_int: nil).count).to eq(1)
+      expect(null_model.find_by(id: 1).null_literal_string).to eq('NULL')
     end
   end
 end
