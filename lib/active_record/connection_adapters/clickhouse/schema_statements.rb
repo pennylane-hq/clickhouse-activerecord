@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require 'base64'
+require 'net/http'
 require 'clickhouse-activerecord/version'
 
 module ActiveRecord
@@ -11,6 +12,9 @@ module ActiveRecord
         HTTP_AUTH_BASIC = :basic
         HTTP_AUTH_X_HEADERS = :x_clickhouse_headers
         HTTP_AUTH_TYPES = [HTTP_AUTH_QUERY_PARAMS, HTTP_AUTH_BASIC, HTTP_AUTH_X_HEADERS].freeze
+
+        # Connection-level failures worth a single retry on a fresh connection.
+        RETRYABLE_CONNECTION_ERRORS = [Net::OpenTimeout, EOFError, Errno::ECONNRESET, IOError].freeze
 
         def with_settings(**settings)
           @block_settings ||= {}
@@ -37,14 +41,14 @@ module ActiveRecord
         #   end
         #   # sends and executes "SELECT * FROM table"
         def with_response_format(format)
-          prev_format = @response_format
-          @response_format = format
+          stack = response_format_stack
+          stack.push(format)
           yield
         ensure
-          @response_format = prev_format
+          stack.pop
         end
 
-        def execute(sql, name = nil, format: @response_format, settings: {})
+        def execute(sql, name = nil, format: response_format, settings: {})
           with_response_format(format) do
             log(sql, [adapter_name, name].compact.join(' ')) do
               raw_execute(sql, settings: settings)
@@ -60,10 +64,10 @@ module ActiveRecord
 
         # Execute an SQL query and save the result to a file in stream mode
         # @return [Tempfile]
-        def execute_to_file(sql, name = nil, format: @response_format, settings: {})
+        def execute_to_file(sql, name = nil, format: response_format, settings: {})
           with_response_format(format) do
             log(sql, [adapter_name, 'Stream', name].compact.join(' ')) do
-              statement = Statement.new(sql, format: @response_format)
+              statement = Statement.new(sql, format: response_format)
               result = nil
               @lock.synchronize do
                 req = Net::HTTP::Post.new("/?#{settings_params(settings)}", build_request_headers)
@@ -84,19 +88,35 @@ module ActiveRecord
         end
 
         def internal_exec_query(sql, name = nil, binds = [], prepare: false, async: false, allow_retry: false)
-          result = execute(sql, name)
-          columns = result['meta'].map { |m| m['name'] }
-          types = {}
-          result['meta'].each_with_index do |m, i|
-            # need use column name and index after commit in 7.2:
-            # https://github.com/rails/rails/commit/24dbf7637b1d5cd6eb3d7100b8d0f6872c3fee3c
-            types[m['name']] = types[i] = type_map.lookup(m['type'])
+          connection_retries = 0
+          begin
+            result = execute(sql, name)
+            columns = result['meta'].map { |m| m['name'] }
+            types = {}
+            result['meta'].each_with_index do |m, i|
+              # need use column name and index after commit in 7.2:
+              # https://github.com/rails/rails/commit/24dbf7637b1d5cd6eb3d7100b8d0f6872c3fee3c
+              types[m['name']] = types[i] = type_map.lookup(m['type'])
+            end
+            ActiveRecord::Result.new(columns, result['data'], types)
+          rescue ActiveRecord::ActiveRecordError => e
+            raise e
+          rescue Net::ReadTimeout => e
+            raise ActiveRecord::AdapterTimeout, "Response: #{e.message}"
+          rescue *RETRYABLE_CONNECTION_ERRORS => e
+            raise ActiveRecord::ConnectionFailed, "Response: #{e.message}" if connection_retries.positive?
+
+            connection_retries += 1
+            logger&.warn("[clickhouse-activerecord] retrying read query after connection failure (#{e.class}: #{e.message})")
+            begin
+              reconnect
+            rescue StandardError
+              nil
+            end
+            retry
+          rescue StandardError => e
+            raise ActiveRecord::ActiveRecordError, "Response: #{e.message}"
           end
-          ActiveRecord::Result.new(columns, result['data'], types)
-        rescue ActiveRecord::ActiveRecordError => e
-          raise e
-        rescue StandardError => e
-          raise ActiveRecord::ActiveRecordError, "Response: #{e.message}"
         end
 
         def exec_insert_all(sql, name)
@@ -113,7 +133,7 @@ module ActiveRecord
         # @link https://clickhouse.com/docs/en/sql-reference/statements/delete
         def exec_delete(sql, name = nil, _binds = [])
           log(sql, "#{adapter_name} #{name}") do
-            statement = Statement.new(sql, format: @response_format)
+            statement = Statement.new(sql, format: response_format)
             res = request(statement)
             begin
               data = JSON.parse(res.header['x-clickhouse-summary'])
@@ -285,6 +305,7 @@ module ActiveRecord
 
         def extract_value_from_default(default_expression, default_type)
           return nil if default_type != 'DEFAULT' || default_expression.blank?
+          return nil if default_expression == 'NULL'
           return nil if has_default_function?(default_expression)
 
           # Convert string
@@ -302,7 +323,7 @@ module ActiveRecord
         end
 
         def raw_execute(sql, settings: {}, except_params: [])
-          statement = Statement.new(sql, format: @response_format)
+          statement = Statement.new(sql, format: response_format)
           response = request(statement, settings: settings, except_params: except_params)
           statement.processed_response(response)
         end
@@ -323,6 +344,19 @@ module ActiveRecord
         def log_with_debug(sql, name = nil)
           return yield unless @debug
           log(sql, "#{name} (system)") { yield }
+        end
+
+        # The response format that should be applied to the next request.
+        # Reads the per-thread override pushed by `with_response_format`, falling
+        # back to the adapter-level default when no override is in scope.
+        def response_format
+          stack = response_format_stack
+          stack.empty? ? @default_response_format : stack.last
+        end
+
+        def response_format_stack
+          key = (@response_format_stack_key ||= :"clickhouse_response_format_stack_#{object_id}")
+          Thread.current[key] ||= []
         end
 
         def settings_params(settings = {}, except: [])
