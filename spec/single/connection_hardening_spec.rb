@@ -40,6 +40,37 @@ RSpec.describe 'Connection hardening' do
       end
     end
 
+    context 'when the handshake fails with a connection-level error' do
+      let(:config) { { adapter: 'clickhouse', host: 'localhost', database: 'db' } }
+
+      before { allow_any_instance_of(ActiveRecord::ConnectionAdapters::ClickhouseAdapter).to receive(:sleep) }
+
+      it 'retries once on a fresh connection and succeeds' do
+        attempts = 0
+        allow(Net::HTTP).to receive(:start) do
+          attempts += 1
+          attempts == 1 ? raise(Errno::ECONNRESET, 'SSL_connect') : http_connection
+        end
+
+        expect { ActiveRecord::Base.clickhouse_connection(config) }.not_to raise_error
+        expect(attempts).to eq(2)
+      end
+
+      it 'only retries once, then raises ActiveRecord::ConnectionFailed' do
+        allow(Net::HTTP).to receive(:start).and_raise(Errno::ECONNRESET, 'SSL_connect')
+
+        expect { ActiveRecord::Base.clickhouse_connection(config) }.to raise_error(ActiveRecord::ConnectionFailed)
+        expect(Net::HTTP).to have_received(:start).twice
+      end
+
+      it 'does not retry non connection-level errors' do
+        allow(Net::HTTP).to receive(:start).and_raise(OpenSSL::SSL::SSLError)
+
+        expect { ActiveRecord::Base.clickhouse_connection(config) }.to raise_error(OpenSSL::SSL::SSLError)
+        expect(Net::HTTP).to have_received(:start).once
+      end
+    end
+
     context 'by default' do
       let(:config) { { adapter: 'clickhouse', host: 'localhost', database: 'db' } }
 

@@ -639,14 +639,10 @@ module ActiveRecord
 
       private
 
+      CONNECT_RETRY_DELAY = 0.1
+
       def connect
-        @connection = @connection_parameters[:connection] || Net::HTTP.start(
-          @connection_parameters[:host],
-          @connection_parameters[:port],
-          use_ssl: @connection_parameters[:ssl],
-          verify_mode: @connection_parameters[:insecure] ? OpenSSL::SSL::VERIFY_NONE : OpenSSL::SSL::VERIFY_PEER,
-          **{ open_timeout: @connection_parameters[:open_timeout] }.compact
-        )
+        @connection = @connection_parameters[:connection] || start_http_connection
 
         @connection.ca_file = @connection_parameters[:sslca] if @connection_parameters[:sslca]
         @connection.read_timeout = @connection_parameters[:read_timeout] if @connection_parameters[:read_timeout]
@@ -656,6 +652,26 @@ module ActiveRecord
         @connection.keep_alive_timeout = @connection_parameters[:keep_alive_timeout] || 10
 
         @connection
+      end
+
+      def start_http_connection
+        retried = false
+        begin
+          Net::HTTP.start(
+            @connection_parameters[:host],
+            @connection_parameters[:port],
+            use_ssl: @connection_parameters[:ssl],
+            verify_mode: @connection_parameters[:insecure] ? OpenSSL::SSL::VERIFY_NONE : OpenSSL::SSL::VERIFY_PEER,
+            **{ open_timeout: @connection_parameters[:open_timeout] }.compact
+          )
+        rescue *Clickhouse::SchemaStatements::RETRYABLE_CONNECTION_ERRORS => e
+          raise ActiveRecord::ConnectionFailed, "Connect: #{e.message}" if retried
+
+          retried = true
+          logger&.warn("[clickhouse-activerecord] retrying connect after failure (#{e.class}: #{e.message})")
+          sleep(CONNECT_RETRY_DELAY)
+          retry
+        end
       end
 
       def reconnect
