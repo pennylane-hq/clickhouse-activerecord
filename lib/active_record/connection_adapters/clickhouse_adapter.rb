@@ -382,7 +382,7 @@ module ActiveRecord
 
       def primary_keys(table_name)
         if Gem::Version.new(server_version) >= Gem::Version.new('23.4')
-          structure = do_system_execute("SHOW COLUMNS FROM `#{table_name}`")
+          structure = do_system_execute("SHOW COLUMNS FROM `#{table_name}`", format: 'JSONCompact')
           return structure['data'].select {|m| m[3]&.include?('PRI') }.pluck(0)
         end
 
@@ -419,7 +419,7 @@ module ActiveRecord
           drop_table(table_name, options.merge(if_exists: true))
         end
 
-        execute(schema_creation.accept(td), settings: request_settings)
+        do_system_execute(schema_creation.accept(td), settings: request_settings)
       end
 
       def create_table(table_name, request_settings: {}, **options, &block)
@@ -436,7 +436,7 @@ module ActiveRecord
           drop_table(table_name, options.merge(if_exists: true))
         end
 
-        execute(schema_creation.accept(td), settings: request_settings)
+        do_system_execute(schema_creation.accept(td), settings: request_settings)
 
         if options[:with_distributed]
           distributed_table_name = options.delete(:with_distributed)
@@ -504,7 +504,7 @@ module ActiveRecord
       end
 
       def change_column(table_name, column_name, type, **options)
-        result = execute("ALTER TABLE #{quote_table_name(table_name)} #{change_column_for_alter(table_name, column_name, type, **options)}", nil, settings: {wait_end_of_query: 1, send_progress_in_http_headers: 1})
+        result = do_system_execute("ALTER TABLE #{quote_table_name(table_name)} #{change_column_for_alter(table_name, column_name, type, **options)}", nil, settings: {wait_end_of_query: 1, send_progress_in_http_headers: 1})
         raise "Error parse json response: #{result}" if result.presence && !result.is_a?(Hash)
       end
 
