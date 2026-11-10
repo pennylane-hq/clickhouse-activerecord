@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require 'clickhouse-activerecord/structure_dumper'
+
 module ClickhouseActiverecord
   class Tasks
     delegate :connection, :establish_connection, to: ActiveRecord::Base
@@ -34,30 +36,10 @@ module ClickhouseActiverecord
       create
     end
 
-    def structure_dump(*args)
+    def structure_dump(path, *)
       establish_master_connection
 
-      # get all tables
-      tables = connection.execute("SHOW TABLES FROM #{@configuration.database} WHERE name NOT LIKE '.inner_id.%'")['data'].flatten.map do |table|
-        connection.show_create_table(table, single_line: false).gsub("#{@configuration.database}.", '')
-      end.compact
-
-      # sort view to last
-      tables.sort_by! {|table| table.match(/^CREATE\s+(MATERIALIZED\s+)?VIEW/) ? 1 : 0}
-
-      # get all functions
-      functions = connection.execute("SELECT create_query FROM system.functions WHERE origin = 'SQLUserDefined' ORDER BY name")['data'].flatten
-
-      # put to file
-      File.open(args.first, 'w:utf-8') do |file|
-        functions.each do |function|
-          file.puts function.gsub('\\n', "\n") + ";\n\n"
-        end
-
-        tables.each do |table|
-          file.puts table + ";\n\n"
-        end
-      end
+      StructureDumper.new(connection, @configuration.database).dump(path)
     end
 
     def structure_load(*args)
