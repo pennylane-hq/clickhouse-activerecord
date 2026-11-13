@@ -186,6 +186,36 @@ RSpec.describe 'Schema cache fill' do
     end
   end
 
+  # Rails 7.1 passes a connection to `SchemaCache#add_all`, Rails 7.2 and later pass a pool.
+  # CI does not run Rails 7.1, so drive the hook with both shapes on every version.
+  describe 'the add_all hook' do
+    let(:schema_cache) do
+      rails_schema_cache = Class.new { def add_all(pool_or_connection) = pool_or_connection }
+      Class.new(rails_schema_cache) { prepend CoreExtensions::ActiveRecord::SchemaCache }.new
+    end
+
+    it 'loads in bulk when Rails passes a connection' do
+      expect(connection).to receive(:with_bulk_schema_load).and_call_original
+
+      expect(schema_cache.add_all(connection)).to equal(connection)
+    end
+
+    it 'loads in bulk when Rails passes a pool' do
+      pool = ActiveRecord::Base.connection_pool
+      expect(connection).to receive(:with_bulk_schema_load).and_call_original
+
+      expect(schema_cache.add_all(pool)).to equal(pool)
+    end
+
+    it 'leaves a connection that cannot load in bulk alone' do
+      other_connection = Object.new
+      pool = instance_double(ActiveRecord::ConnectionAdapters::ConnectionPool)
+      allow(pool).to receive(:with_connection).and_yield(other_connection)
+
+      expect(schema_cache.add_all(pool)).to equal(pool)
+    end
+  end
+
   describe 'on a server older than 23.4' do
     it 'keeps the request per table' do
       allow(connection).to receive(:server_version).and_return('23.3.9.55')
