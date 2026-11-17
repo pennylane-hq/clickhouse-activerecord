@@ -1,6 +1,7 @@
 ### Unreleased
 
 * Fill the whole schema cache with one `system.columns` query instead of two requests per table (ClickHouse 23.4 and later)
+* Order composite primary keys like the table's key instead of alphabetically. Keys that hold an expression keep the alphabetical order (ClickHouse 23.4 and later)
 
 ### Version 1.7.0 (Sep 29, 2026)
 

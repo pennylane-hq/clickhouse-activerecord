@@ -23,6 +23,14 @@ RSpec.describe 'Schema cache fill' do
         ) ENGINE = MergeTree ORDER BY (b, a)
       SQL
       sc_single_key: 'CREATE TABLE sc_single_key (id UInt64, name String) ENGINE = MergeTree ORDER BY id',
+      sc_key_order: <<~SQL,
+        CREATE TABLE sc_key_order (company_id UInt64, plan_item_id UInt64, ledger_event_id UInt64)
+        ENGINE = MergeTree ORDER BY (company_id, plan_item_id, ledger_event_id)
+      SQL
+      sc_quoted_key: 'CREATE TABLE sc_quoted_key (`my col` UInt8, b UInt8) ENGINE = MergeTree ORDER BY (b, `my col`)',
+      sc_expression_key: <<~SQL,
+        CREATE TABLE sc_expression_key (ts DateTime, id UInt64) ENGINE = MergeTree ORDER BY (id, toDate(ts))
+      SQL
       sc_no_key: 'CREATE TABLE sc_no_key (x UInt8) ENGINE = MergeTree ORDER BY tuple()',
       sc_primary_key_prefix: <<~SQL,
         CREATE TABLE sc_primary_key_prefix (id UInt64, ts DateTime) ENGINE = MergeTree PRIMARY KEY id ORDER BY (id, ts)
@@ -85,7 +93,7 @@ RSpec.describe 'Schema cache fill' do
     [File.read(path), queries]
   end
 
-  # Today's behaviour: one DESCRIBE TABLE and one SHOW COLUMNS per table
+  # The single table lookups: one DESCRIBE TABLE and one primary key request per table
   def dump_cache_per_table(name)
     allow(connection).to receive(:with_bulk_schema_load) { |&block| block.call }
     dump_cache(name)
@@ -124,15 +132,14 @@ RSpec.describe 'Schema cache fill' do
 
       expect(queries.grep(/system\.columns/).size).to eq(1)
       expect(queries.grep(/DESCRIBE TABLE/)).to be_empty
-      expect(queries.grep(/SHOW COLUMNS/)).to be_empty
     end
 
     it 'sends two requests per table without it' do
       _, queries = dump_cache_per_table('per_table')
 
-      expect(queries.grep(/system\.columns/)).to be_empty
+      expect(queries.grep(/table NOT LIKE/)).to be_empty
       expect(queries.grep(/DESCRIBE TABLE/).size).to be >= ddl.size
-      expect(queries.grep(/SHOW COLUMNS/).size).to be >= ddl.size
+      expect(queries.grep(/system\.columns.*table = '/).size).to be >= ddl.size
     end
 
     it 'keeps the shape of the primary keys' do
@@ -142,10 +149,24 @@ RSpec.describe 'Schema cache fill' do
       expect(cache.primary_keys('sc_no_key')).to be_nil
       expect(cache.primary_keys('sc_single_key')).to eq('id')
       expect(cache.primary_keys('sc_primary_key_prefix')).to eq('id')
-      expect(cache.primary_keys('sc_composite_key')).to eq(%w[a b])
+      expect(cache.primary_keys('sc_composite_key')).to eq(%w[b a])
       expect(cache.primary_keys('sc_view')).to be_nil
       expect(cache.primary_keys('sc_materialized_view')).to be_nil
       expect(cache.primary_keys('sc_dictionary')).to be_nil
+    end
+
+    it "follows the table's key order" do
+      dump_cache('bulk')
+      cache = connection.schema_cache
+
+      expect(cache.primary_keys('sc_key_order')).to eq(%w[company_id plan_item_id ledger_event_id])
+      expect(cache.primary_keys('sc_quoted_key')).to eq(['b', 'my col'])
+    end
+
+    it 'keeps the alphabetical order when the key holds an expression' do
+      dump_cache('bulk')
+
+      expect(connection.schema_cache.primary_keys('sc_expression_key')).to eq(%w[id ts])
     end
 
     it 'keeps alias and materialized columns, skips ephemeral ones and strips the codec wrapper' do
@@ -181,8 +202,16 @@ RSpec.describe 'Schema cache fill' do
       queries = queries_during { connection.schema_cache.add('sc_composite_key') }
 
       expect(queries.grep(/DESCRIBE TABLE `sc_composite_key`/).size).to eq(1)
-      expect(queries.grep(/SHOW COLUMNS FROM `sc_composite_key`/).size).to eq(1)
-      expect(queries.grep(/system\.columns/)).to be_empty
+      expect(queries.grep(/system\.columns.*table = 'sc_composite_key'/).size).to eq(1)
+      expect(queries.grep(/table NOT LIKE/)).to be_empty
+    end
+
+    it "follow the table's key order like the bulk load" do
+      connection.schema_cache.clear!
+
+      expect(connection.primary_key('sc_key_order')).to eq(%w[company_id plan_item_id ledger_event_id])
+      expect(connection.primary_key('sc_quoted_key')).to eq(['b', 'my col'])
+      expect(connection.primary_key('sc_expression_key')).to eq(%w[id ts])
     end
   end
 

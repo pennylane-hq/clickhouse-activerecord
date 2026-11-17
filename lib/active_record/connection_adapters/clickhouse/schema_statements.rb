@@ -303,18 +303,21 @@ module ActiveRecord
         private
 
         # One query for all tables. It gives what `DESCRIBE TABLE` gives for the columns (same
-        # order, ephemeral columns included) and what `SHOW COLUMNS` gives for the primary keys
-        # (alphabetical). Same table filter as `tables`.
+        # order, ephemeral columns included) and what `primary_keys` gives for the primary keys.
+        # Same table filter as `tables`.
         def load_bulk_schema
           result = do_system_execute(<<~SQL.squish, 'SCHEMA')
-            SELECT table, name, type, default_kind, default_expression, comment, compression_codec, is_in_primary_key
-            FROM system.columns
-            WHERE database = currentDatabase() AND table NOT LIKE '.inner_id.%'
-            ORDER BY table, position
+            SELECT c.table, c.name, c.type, c.default_kind, c.default_expression, c.comment, c.compression_codec,
+              c.is_in_primary_key, t.primary_key
+            FROM system.columns AS c
+            LEFT JOIN system.tables AS t ON t.database = c.database AND t.name = c.table
+            WHERE c.database = currentDatabase() AND c.table NOT LIKE '.inner_id.%'
+            ORDER BY c.table, c.position
           SQL
 
           schema = { structures: {}, primary_keys: {} }
-          result['data'].each do |table, name, type, default_kind, default_expression, comment, codec, in_primary_key|
+          key_expressions = {}
+          result['data'].each do |table, name, type, default_kind, default_expression, comment, codec, in_primary_key, key_expression|
             (schema[:structures][table] ||= []) << Clickhouse::DescribedColumn.new(
               name: name,
               sql_type: type,
@@ -326,9 +329,31 @@ module ActiveRecord
             )
             keys = (schema[:primary_keys][table] ||= [])
             keys << name if in_primary_key.to_i == 1
+            key_expressions[table] = key_expression
           end
-          schema[:primary_keys].each_value(&:sort!)
+          schema[:primary_keys].each do |table, keys|
+            schema[:primary_keys][table] = ordered_primary_keys(keys, key_expressions[table])
+          end
           schema
+        end
+
+        # One query for one table, same result as the bulk load gives for it.
+        def load_primary_keys(table_name)
+          result = do_system_execute(<<~SQL.squish, 'SCHEMA')
+            SELECT name, (SELECT primary_key FROM system.tables WHERE database = currentDatabase() AND name = #{quote(table_name)})
+            FROM system.columns
+            WHERE database = currentDatabase() AND table = #{quote(table_name)} AND is_in_primary_key
+          SQL
+
+          ordered_primary_keys(result['data'].map(&:first), result['data'].dig(0, 1))
+        end
+
+        # The key columns in the order of the table's key, as written in `system.tables.primary_key`
+        # (for example "company_id, plan_item_id"). When the key holds an expression, its parts are
+        # not the key columns, so they keep the alphabetical order.
+        def ordered_primary_keys(key_columns, key_expression)
+          ordered = key_expression.to_s.split(', ').map { |part| part.delete_prefix('`').delete_suffix('`') }
+          ordered.sort == key_columns.sort ? ordered : key_columns.sort
         end
 
         def schema_creation
